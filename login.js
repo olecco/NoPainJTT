@@ -23,6 +23,8 @@ let currentMonth = new Date();
 currentMonth.setDate(1);
 currentMonth.setHours(0, 0, 0, 0);
 let authCookieHeaderValue = null; // "JSESSIONID=...; atlassian.xsrf.token=..."
+let holidaysByDate = new Map(); // YYYY-MM-DD -> holiday name (fname)
+let fetchedHolidayYears = new Set(); // years already fetched
 
 function pad2(n) {
   return String(n).padStart(2, "0");
@@ -41,6 +43,24 @@ function mondayIndex(jsDay) {
   return (jsDay + 6) % 7;
 }
 
+async function fetchHolidays(year) {
+  if (fetchedHolidayYears.has(year)) return;
+  try {
+    const res = await fetch(`https://get.api-feiertage.de/?years=${year}&states=by`);
+    const json = await res.json();
+    if (json?.status === "success" && Array.isArray(json.feiertage)) {
+      for (const day of json.feiertage) {
+        if (day?.by === "1" && day?.date) {
+          holidaysByDate.set(day.date, day.fname ?? "Holiday");
+        }
+      }
+    }
+    fetchedHolidayYears.add(year);
+  } catch {
+    // silently ignore – holidays just won't render
+  }
+}
+
 function renderCalendar() {
   if (!gridEl || !monthLabelEl) return;
 
@@ -56,6 +76,10 @@ function renderCalendar() {
   realCurrentMonthStart.setHours(0, 0, 0, 0);
   const currentWeekStart = new Date(now);
   currentWeekStart.setDate(now.getDate() - mondayIndex(now.getDay()));
+  // If today is Monday, also keep previous week's weekdays open
+  if (now.getDay() === 1) {
+    currentWeekStart.setDate(currentWeekStart.getDate() - 7);
+  }
   currentWeekStart.setHours(0, 0, 0, 0);
 
   const year = currentMonth.getFullYear();
@@ -83,14 +107,20 @@ function renderCalendar() {
     if (key === todayKey) cell.classList.add("today");
     if (!isAuthed) cell.classList.add("disabled");
 
+    const holidayName = holidaysByDate.get(key);
+    if (holidayName) {
+      cell.classList.add("holiday");
+      cell.title = holidayName;
+    }
+
     cell.textContent = String(d.getDate());
     cell.dataset.date = key;
     cell.tabIndex = 0;
     cell.setAttribute("role", "button");
-    cell.setAttribute("aria-label", key);
+    cell.setAttribute("aria-label", holidayName ? `${key} – ${holidayName}` : key);
     cell.setAttribute(
       "aria-disabled",
-      String(!isAuthed || cell.classList.contains("weekend") || cell.classList.contains("closedWeek"))
+      String(!isAuthed || cell.classList.contains("weekend") || cell.classList.contains("closedWeek") || cell.classList.contains("holiday"))
     );
     gridEl.appendChild(cell);
   }
@@ -377,6 +407,7 @@ async function login() {
 
     if (jsessionid !== "<not found>" && xsrf !== "<not found>") {
       authCookieHeaderValue = `JSESSIONID=${jsessionid}; atlassian.xsrf.token=${xsrf}`;
+      await fetchHolidays(currentMonth.getFullYear());
       await fetchWorklogsAndRender();
     }
 
@@ -390,13 +421,15 @@ async function login() {
   }
 }
 
-prevMonthBtn?.addEventListener("click", () => {
+prevMonthBtn?.addEventListener("click", async () => {
   currentMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() - 1, 1);
+  if (authCookieHeaderValue) await fetchHolidays(currentMonth.getFullYear());
   renderCalendar();
 });
 
-nextMonthBtn?.addEventListener("click", () => {
+nextMonthBtn?.addEventListener("click", async () => {
   currentMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 1);
+  if (authCookieHeaderValue) await fetchHolidays(currentMonth.getFullYear());
   renderCalendar();
 });
 
@@ -413,7 +446,7 @@ gridEl?.addEventListener("pointerdown", (e) => {
   const cell = target.closest?.(".day");
   if (!(cell instanceof HTMLElement)) return;
   if (!authCookieHeaderValue) return;
-  if (cell.classList.contains("mutedPrev") || cell.classList.contains("closedWeek")) return;
+  if (cell.classList.contains("mutedPrev") || cell.classList.contains("closedWeek") || cell.classList.contains("holiday")) return;
   setPressedCell(cell);
 });
 
@@ -431,6 +464,11 @@ gridEl?.addEventListener("click", async (e) => {
   if (!(target instanceof HTMLElement)) return;
   const cell = target.closest?.(".day");
   if (!(cell instanceof HTMLElement)) return;
+  if (cell.classList.contains("holiday")) {
+    const hName = holidaysByDate.get(cell.dataset.date) ?? "Holiday";
+    setStatus(`${hName} – no tracking.`);
+    return;
+  }
   if (cell.classList.contains("mutedPrev") || cell.classList.contains("closedWeek")) {
     setStatus("Tracking for this date is closed");
     return;
@@ -481,6 +519,12 @@ gridEl?.addEventListener("click", async (e) => {
 });
 
 loginBtn?.addEventListener("click", login);
+
+function onEnterLogin(e) {
+  if (e.key === "Enter") login();
+}
+nameEl?.addEventListener("keydown", onEnterLogin);
+passwordEl?.addEventListener("keydown", onEnterLogin);
 setStatus("Ready.");
 renderCalendar();
 
@@ -491,6 +535,8 @@ logoutBtn?.addEventListener("click", () => {
   authCookieHeaderValue = null;
   worklogDates = new Set();
   worklogsByDate = new Map();
+  holidaysByDate = new Map();
+  fetchedHolidayYears = new Set();
   clearPressed();
   renderCalendar();
   setStatus("Logged out.");
