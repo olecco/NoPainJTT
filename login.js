@@ -7,7 +7,6 @@ const logoutBtn = document.getElementById("logout");
 const nameEl = document.getElementById("name");
 const passwordEl = document.getElementById("password");
 const loginBtn = document.getElementById("login");
-const api = globalThis.browser ?? globalThis.chrome;
 
 function setStatus(text) {
   if (statusEl) statusEl.textContent = text;
@@ -126,106 +125,78 @@ function renderCalendar() {
   }
 }
 
-function upsertHeader(headers, name, value) {
-  const lower = name.toLowerCase();
-  const existing = headers.find((h) => String(h?.name ?? "").toLowerCase() === lower);
-  if (existing) existing.value = value;
-  else headers.push({ name, value });
+// ---------------------------------------------------------------------------
+// Service-worker messaging helpers
+// ---------------------------------------------------------------------------
+
+/** Send a message to the background service worker and return the response. */
+function sendBg(msg) {
+  return chrome.runtime.sendMessage(msg);
 }
 
-function parseCookieValue(setCookieValue, cookieName) {
-  if (!setCookieValue) return null;
-  const firstPart = (String(setCookieValue).split(";", 1)[0] ?? "").trim();
-  const idx = firstPart.indexOf("=");
-  if (idx < 0) return null;
-  const name = firstPart.slice(0, idx).trim().toLowerCase();
-  if (name !== String(cookieName).toLowerCase()) return null;
-  let value = firstPart.slice(idx + 1).trim();
-  if (
-    (value.startsWith("\"") && value.endsWith("\"")) ||
-    (value.startsWith("'") && value.endsWith("'"))
-  ) {
-    value = value.slice(1, -1);
-  }
-  return value;
+/**
+ * Ask the service worker to install declarativeNetRequest session rules that
+ * inject Cookie, Origin, and Referer on every extension→JTT request.
+ */
+async function activateAuthRules(cookieValue) {
+  const res = await sendBg({ type: "SET_AUTH", cookieValue });
+  if (!res?.ok) throw new Error(res?.error ?? "SET_AUTH failed");
 }
 
-function formatResponseHeaders(responseHeaders) {
-  const lines = [];
-  for (const h of responseHeaders ?? []) {
-    const name = String(h?.name ?? "").trim();
-    if (!name) continue;
-    const value = typeof h?.value === "string" ? h.value : "";
-    lines.push(`${name}: ${value}`);
-  }
-  return lines.join("\n");
+/** Ask the service worker to remove all auth session rules. */
+async function deactivateAuthRules() {
+  const res = await sendBg({ type: "CLEAR_AUTH" });
+  if (!res?.ok) throw new Error(res?.error ?? "CLEAR_AUTH failed");
 }
 
-function escapeRegExp(s) {
-  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
+ * Read JSESSIONID + xsrf token from the browser cookie store via the service
+ * worker (which has the cookies permission).
+ */
+async function readJttCookies() {
+  const res = await sendBg({ type: "GET_COOKIES" });
+  if (!res?.ok) throw new Error(res?.error ?? "GET_COOKIES failed");
+  return { jsessionid: res.jsessionid, xsrf: res.xsrf };
 }
 
-function extractCookieFromSetCookieBlob(blob, cookieName) {
-  if (!blob) return null;
-  const re = new RegExp(`${escapeRegExp(cookieName)}=([^;\\r\\n]+)`, "i");
-  const m = String(blob).match(re);
-  return m?.[1] ?? null;
-}
+// ---------------------------------------------------------------------------
+// API helpers (fetch calls – headers injected by DNR session rules)
+// ---------------------------------------------------------------------------
 
 async function fetchWorklogsAndRender() {
   if (!authCookieHeaderValue) {
     setStatus("Not authenticated.");
     return;
   }
-  if (!api?.webRequest?.onBeforeSendHeaders) {
-    throw new Error("webRequest API not available");
-  }
 
-  const listUrl = "https://jtt.in.devexperts.com/v1/api/worklogs/list".trim();
-  const cookieListener = (details) => {
-    const headers = details.requestHeaders ?? [];
-    upsertHeader(headers, "Cookie", authCookieHeaderValue);
-    upsertHeader(headers, "Origin", "https://jtt.in.devexperts.com");
-    upsertHeader(headers, "Referer", "https://jtt.in.devexperts.com/");
-    return { requestHeaders: headers };
-  };
+  const listUrl = "https://jtt.in.devexperts.com/v1/api/worklogs/list";
 
-  api.webRequest.onBeforeSendHeaders.addListener(
-    cookieListener,
-    { urls: [listUrl] },
-    ["blocking", "requestHeaders"]
-  );
-
+  const listRes = await fetch(listUrl, { method: "GET" });
+  const bodyText = await listRes.text().catch(() => "");
+  let json;
   try {
-    const listRes = await fetch(listUrl, { method: "GET" });
-    const bodyText = await listRes.text().catch(() => "");
-    let json;
-    try {
-      json = JSON.parse(bodyText);
-    } catch {
-      json = null;
-    }
-
-    const worklogs = Array.isArray(json?.worklogs) ? json.worklogs : [];
-    const byDate = new Map();
-    for (const w of worklogs) {
-      const id = w?.id;
-      const t = w?.startTime;
-      const d = new Date(t);
-      if (Number.isNaN(d.getTime())) continue;
-      const key = ymdLocal(d); // local date key to match calendar clicks
-      const arr = byDate.get(key) ?? [];
-      arr.push({ id });
-      byDate.set(key, arr);
-    }
-
-    worklogsByDate = byDate;
-    worklogDates = new Set(byDate.keys());
-    renderCalendar();
-    setStatus(`Loaded ${worklogDates.size} worklog day(s).`);
-  } finally {
-    api.webRequest.onBeforeSendHeaders.removeListener(cookieListener);
+    json = JSON.parse(bodyText);
+  } catch {
+    json = null;
   }
+
+  const worklogs = Array.isArray(json?.worklogs) ? json.worklogs : [];
+  const byDate = new Map();
+  for (const w of worklogs) {
+    const id = w?.id;
+    const t = w?.startTime;
+    const d = new Date(t);
+    if (Number.isNaN(d.getTime())) continue;
+    const key = ymdLocal(d); // local date key to match calendar clicks
+    const arr = byDate.get(key) ?? [];
+    arr.push({ id });
+    byDate.set(key, arr);
+  }
+
+  worklogsByDate = byDate;
+  worklogDates = new Set(byDate.keys());
+  renderCalendar();
+  setStatus(`Loaded ${worklogDates.size} worklog day(s).`);
 }
 
 async function deleteWorklogsForDate(dateKey) {
@@ -233,38 +204,17 @@ async function deleteWorklogsForDate(dateKey) {
     setStatus("Not authenticated.");
     return;
   }
-  if (!api?.webRequest?.onBeforeSendHeaders) {
-    throw new Error("webRequest API not available");
-  }
 
   const items = worklogsByDate.get(dateKey) ?? [];
   for (const item of items) {
     const id = item?.id;
     if (id == null || id === "") continue;
 
-    const delUrl = `https://jtt.in.devexperts.com/v1/api/worklogs/${id}`.trim();
-    const delListener = (details) => {
-      const headers = details.requestHeaders ?? [];
-      upsertHeader(headers, "Cookie", authCookieHeaderValue);
-      upsertHeader(headers, "Origin", "https://jtt.in.devexperts.com");
-      upsertHeader(headers, "Referer", "https://jtt.in.devexperts.com/");
-      return { requestHeaders: headers };
-    };
-
-    api.webRequest.onBeforeSendHeaders.addListener(
-      delListener,
-      { urls: [delUrl] },
-      ["blocking", "requestHeaders"]
-    );
-
-    try {
-      const res = await fetch(delUrl, { method: "DELETE" });
-      if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        throw new Error(`DELETE ${id} failed (HTTP ${res.status}) ${t}`);
-      }
-    } finally {
-      api.webRequest.onBeforeSendHeaders.removeListener(delListener);
+    const delUrl = `https://jtt.in.devexperts.com/v1/api/worklogs/${id}`;
+    const res = await fetch(delUrl, { method: "DELETE" });
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      throw new Error(`DELETE ${id} failed (HTTP ${res.status}) ${t}`);
     }
   }
 }
@@ -282,7 +232,7 @@ async function createWorklogForDate(dateKey) {
   const startLocal = new Date(y, m - 1, d, 9, 0, 0, 0);
   const endLocal = new Date(y, m - 1, d, 17, 0, 0, 0);
 
-  const postUrl = "https://jtt.in.devexperts.com/v1/api/worklogs/".trim();
+  const postUrl = "https://jtt.in.devexperts.com/v1/api/worklogs/";
   const payload = {
     comment: "",
     endTime: endLocal.toISOString(),
@@ -290,35 +240,20 @@ async function createWorklogForDate(dateKey) {
     startTime: startLocal.toISOString()
   };
 
-  const postListener = (details) => {
-    const headers = details.requestHeaders ?? [];
-    upsertHeader(headers, "Cookie", authCookieHeaderValue);
-    upsertHeader(headers, "Origin", "https://jtt.in.devexperts.com");
-    upsertHeader(headers, "Content-Type", "application/json");
-    upsertHeader(headers, "Referer", "https://jtt.in.devexperts.com/");
-    return { requestHeaders: headers };
-  };
-
-  api.webRequest.onBeforeSendHeaders.addListener(
-    postListener,
-    { urls: [postUrl] },
-    ["blocking", "requestHeaders"]
-  );
-
-  try {
-    const res = await fetch(postUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-    if (!res.ok) {
-      const t = await res.text().catch(() => "");
-      throw new Error(`POST failed (HTTP ${res.status}) ${t}`);
-    }
-  } finally {
-    api.webRequest.onBeforeSendHeaders.removeListener(postListener);
+  const res = await fetch(postUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`POST failed (HTTP ${res.status}) ${t}`);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Login / Logout
+// ---------------------------------------------------------------------------
 
 async function login() {
   const user = nameEl?.value ?? "";
@@ -327,89 +262,47 @@ async function login() {
   setStatus("Sending...");
   loginBtn.disabled = true;
   try {
-    if (!api?.webRequest?.onBeforeSendHeaders || !api?.webRequest?.onHeadersReceived) {
-      throw new Error("webRequest API not available");
-    }
-
     const targetUrl = "https://jtt.in.devexperts.com/v1/api/auth";
-    const cookiesPromise = new Promise((resolve) => {
-      const onHeaders = (details) => {
-        if (details.url !== targetUrl) return;
-        if (details.method !== "POST") return;
 
-        const responseHeaders = details.responseHeaders ?? [];
-        const setCookieHeaders = responseHeaders.filter(
-          (h) => String(h?.name ?? "").toLowerCase() === "set-cookie"
-        );
-
-        let jsessionid = null;
-        let xsrf = null;
-        for (const h of setCookieHeaders) {
-          const v = typeof h?.value === "string" ? h.value : null;
-          if (jsessionid == null) jsessionid = parseCookieValue(v, "JSESSIONID");
-          if (xsrf == null) xsrf = parseCookieValue(v, "atlassian.xsrf.token");
-        }
-
-        api.webRequest.onHeadersReceived.removeListener(onHeaders);
-        resolve({
-          jsessionid,
-          xsrf,
-          responseHeaders
-        });
-      };
-
-      api.webRequest.onHeadersReceived.addListener(
-        onHeaders,
-        { urls: [targetUrl] },
-        ["responseHeaders"]
-      );
-    });
-
-    const listener = (details) => {
-      const headers = details.requestHeaders ?? [];
-      upsertHeader(headers, "Content-Type", "application/json");
-      upsertHeader(headers, "Origin", "https://jtt.in.devexperts.com");
-      upsertHeader(headers, "Referer", "https://jtt.in.devexperts.com/login");
-      return { requestHeaders: headers };
-    };
-
-    api.webRequest.onBeforeSendHeaders.addListener(
-      listener,
-      { urls: [targetUrl] },
-      ["blocking", "requestHeaders"]
-    );
+    // 1. POST login credentials (no auth cookie needed for this request,
+    //    but we still need Origin/Referer so set temporary rules).
+    await activateAuthRules("__login_pending__");
 
     let res;
-    let cookieInfo;
     try {
       res = await fetch(targetUrl, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password, user })
       });
-      cookieInfo = await cookiesPromise;
-    } finally {
-      api.webRequest.onBeforeSendHeaders.removeListener(listener);
+    } catch (fetchErr) {
+      await deactivateAuthRules();
+      throw fetchErr;
     }
 
-    const responseHeaders = cookieInfo?.responseHeaders ?? [];
-    const setCookieValues = responseHeaders
-      .filter((h) => String(h?.name ?? "").toLowerCase() === "set-cookie")
-      .map((h) => (typeof h?.value === "string" ? h.value : ""))
-      .filter(Boolean);
-    const setCookieBlob = setCookieValues.join("\n");
-
-    const jsessionid = extractCookieFromSetCookieBlob(setCookieBlob, "JSESSIONID") ?? "<not found>";
-    const xsrf =
-      extractCookieFromSetCookieBlob(setCookieBlob, "atlassian.xsrf.token") ?? "<not found>";
-
-    if (jsessionid !== "<not found>" && xsrf !== "<not found>") {
-      authCookieHeaderValue = `JSESSIONID=${jsessionid}; atlassian.xsrf.token=${xsrf}`;
-      await fetchHolidays(currentMonth.getFullYear());
-      await fetchWorklogsAndRender();
+    if (!res.ok) {
+      await deactivateAuthRules();
+      const t = await res.text().catch(() => "");
+      throw new Error(`Login failed (HTTP ${res.status}) ${t}`);
     }
+
+    // 2. Read cookies set by the server from the browser cookie store.
+    const { jsessionid, xsrf } = await readJttCookies();
+
+    if (!jsessionid || !xsrf) {
+      await deactivateAuthRules();
+      throw new Error(
+        `Missing cookies after login. JSESSIONID=${jsessionid ?? "<not found>"}, xsrf=${xsrf ?? "<not found>"}`
+      );
+    }
+
+    // 3. Install proper auth rules with real cookie values.
+    authCookieHeaderValue = `JSESSIONID=${jsessionid}; atlassian.xsrf.token=${xsrf}`;
+    await activateAuthRules(authCookieHeaderValue);
+
+    // 4. Fetch worklogs.
+    await fetchHolidays(currentMonth.getFullYear());
+    await fetchWorklogsAndRender();
 
     setStatus(`Done (HTTP ${res.status}).`);
   } catch (err) {
@@ -420,6 +313,10 @@ async function login() {
     loginBtn.disabled = false;
   }
 }
+
+// ---------------------------------------------------------------------------
+// UI event handlers
+// ---------------------------------------------------------------------------
 
 prevMonthBtn?.addEventListener("click", async () => {
   currentMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() - 1, 1);
@@ -541,28 +438,13 @@ logoutBtn?.addEventListener("click", () => {
   renderCalendar();
   setStatus("Logged out.");
 
-  // Fire-and-forget logout request (best effort).
-  if (cookie && api?.webRequest?.onBeforeSendHeaders) {
-    const url = "https://jtt.in.devexperts.com/v1/api/auth".trim();
-    const logoutListener = (details) => {
-      const headers = details.requestHeaders ?? [];
-      upsertHeader(headers, "Cookie", cookie);
-      upsertHeader(headers, "Origin", "https://jtt.in.devexperts.com");
-      upsertHeader(headers, "Referer", "https://jtt.in.devexperts.com/");
-      return { requestHeaders: headers };
-    };
-
-    api.webRequest.onBeforeSendHeaders.addListener(
-      logoutListener,
-      { urls: [url] },
-      ["blocking", "requestHeaders"]
-    );
-
+  // Fire-and-forget logout request (best effort), then clear rules.
+  if (cookie) {
+    const url = "https://jtt.in.devexperts.com/v1/api/auth";
     fetch(url, { method: "DELETE" })
       .catch(() => {})
       .finally(() => {
-        api.webRequest.onBeforeSendHeaders.removeListener(logoutListener);
+        deactivateAuthRules().catch(() => {});
       });
   }
 });
-
