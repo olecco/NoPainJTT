@@ -11,7 +11,7 @@
         }
       }
   },
-  "permissions": ["webRequest", "webRequestBlocking"],
+  "permissions": ["webRequest", "webRequestBlocking", "storage"],
   "host_permissions": ["https://jtt.in.devexperts.com/*"],
   "action": {
     "default_title": "No Pain JTT",
