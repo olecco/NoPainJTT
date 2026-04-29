@@ -1,21 +1,28 @@
 {
   "manifest_version": 3,
   "name": "No Pain JTT",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "description": "Login helper for JTT (Firefox MV3).",
   "browser_specific_settings": {
-      "gecko": {
-        "id": "@no-pain-jtt",
-        "data_collection_permissions": {
-          "required": ["none"]
-        }
+    "gecko": {
+      "id": "@no-pain-jtt",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
       }
+    }
   },
-  "permissions": ["webRequest", "webRequestBlocking", "storage"],
-  "host_permissions": ["https://jtt.in.devexperts.com/*"],
+  "permissions": [
+    "webRequest",
+    "webRequestBlocking",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://jtt.in.devexperts.com/*"
+  ],
   "action": {
     "default_title": "No Pain JTT",
     "default_popup": "launcher.html"
   }
 }
-
